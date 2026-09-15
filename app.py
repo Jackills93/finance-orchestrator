@@ -7,6 +7,7 @@ import io
 import os
 import re
 import csv
+import hmac
 import json
 import time
 import queue
@@ -18,16 +19,52 @@ import threading
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yfinance as yf
 from flask import Flask, jsonify, render_template, request, send_file
 from dotenv import load_dotenv
+from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 BASE_DIR = Path(__file__).parent
+
+# ---- Sicurezza ---------------------------------------------------------------
+
+# Di default la dashboard ascolta solo su questo PC. Per aprirla da altri
+# dispositivi della rete locale impostare nel .env:
+#   APP_HOST=0.0.0.0
+#   APP_ALLOWED_HOSTS=192.168.1.50,nome-pc   (indirizzi con cui la si apre)
+APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
+APP_PORT = int(os.getenv("APP_PORT", "5000"))
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _allowed_hosts() -> set:
+    extra = os.getenv("APP_ALLOWED_HOSTS", "")
+    return _LOCAL_HOSTS | {h.strip().lower() for h in extra.split(",") if h.strip()}
+
+
+@app.before_request
+def _security_checks():
+    # Host header: blocca il DNS rebinding (un sito esterno il cui dominio
+    # risolve su 127.0.0.1 per leggere o modificare i dati della dashboard)
+    hostname = (urlsplit(f"//{request.host}").hostname or "").lower()
+    if hostname not in _allowed_hosts():
+        return jsonify({"error": "Host non consentito"}), 403
+
+    # CSRF: le richieste che modificano dati devono partire dalla dashboard
+    # stessa, non da una pagina di un altro sito aperta nel browser
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        site = request.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return jsonify({"error": "Richiesta da un altro sito bloccata"}), 403
+        origin = request.headers.get("Origin")
+        if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
+            return jsonify({"error": "Richiesta da un altro sito bloccata"}), 403
 
 # ---- Pipeline state ----------------------------------------------------------
 
@@ -935,12 +972,27 @@ def _mask(val: str) -> str:
         return "••••••••"
     return val[:4] + "••••" + val[-4:]
 
+_LEGACY_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _is_legacy_hash(stored: str) -> bool:
+    return bool(_LEGACY_SHA256.fullmatch(stored))
+
+
+def _hash_password(password: str) -> str:
+    # pbkdf2 invece del default scrypt: scrypt manca in alcune build di Python
+    return generate_password_hash(password, method="pbkdf2:sha256")
+
+
 def _verify_password(password: str) -> bool:
     env = _read_env_raw()
     stored = env.get("SETTINGS_PASSWORD_HASH", "")
     if not stored:
         return True  # no password set yet → open access
-    return hashlib.sha256(password.encode()).hexdigest() == stored
+    if _is_legacy_hash(stored):
+        # Vecchio formato: SHA-256 senza salt (aggiornato al primo salvataggio)
+        return hmac.compare_digest(hashlib.sha256(password.encode()).hexdigest(), stored)
+    return check_password_hash(stored, password)
 
 
 @app.route("/api/settings", methods=["GET"])
@@ -1014,11 +1066,14 @@ def api_settings_save():
         except ValueError:
             pass  # valore non numerico: ignora, mantieni il precedente
 
-    # New password
+    # New password (hash con salt); una password gia verificata nel vecchio
+    # formato SHA-256 viene ri-salvata nel nuovo formato
     new_pwd = data.get("new_password", "").strip()
+    old_pwd = data.get("password", "")
     if new_pwd:
-        _write_env_key("SETTINGS_PASSWORD_HASH",
-                       hashlib.sha256(new_pwd.encode()).hexdigest())
+        _write_env_key("SETTINGS_PASSWORD_HASH", _hash_password(new_pwd))
+    elif old_pwd and _is_legacy_hash(_read_env_raw().get("SETTINGS_PASSWORD_HASH", "")):
+        _write_env_key("SETTINGS_PASSWORD_HASH", _hash_password(old_pwd))
 
     # Reload env in memory so the running process picks up changes
     load_dotenv(str(_ENV_PATH), override=True)
@@ -1029,5 +1084,9 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=_price_monitor, daemon=True).start()
     print("\n  Finance Screener Dashboard")
-    print("  Apri il browser su: http://localhost:5000\n")
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    print(f"  Apri il browser su: http://localhost:{APP_PORT}")
+    if APP_HOST not in _LOCAL_HOSTS:
+        print(f"  ATTENZIONE: in ascolto su {APP_HOST} -- la dashboard e' raggiungibile dalla rete,")
+        print(f"  host consentiti: {', '.join(sorted(_allowed_hosts()))}")
+    print()
+    app.run(debug=False, host=APP_HOST, port=APP_PORT)

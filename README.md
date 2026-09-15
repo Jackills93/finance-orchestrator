@@ -81,6 +81,30 @@ python app.py
 
 Su Windows basta `avvia.bat`, che apre anche il browser.
 
+### Sicurezza della dashboard
+
+Di default la dashboard ascolta solo su `127.0.0.1`, quindi è raggiungibile
+solo dal PC su cui gira. Inoltre:
+
+- le richieste con un header `Host` diverso da `localhost` / `127.0.0.1` vengono
+  rifiutate (protezione dal DNS rebinding);
+- le richieste che modificano dati (POST/DELETE) provenienti da pagine di altri
+  siti aperte nel browser vengono bloccate (protezione CSRF);
+- la password del tab Impostazioni è salvata con hash PBKDF2 e salt (`werkzeug`);
+  un vecchio hash SHA-256 viene aggiornato al primo salvataggio delle impostazioni.
+
+Per aprire la dashboard da altri dispositivi della rete locale:
+
+```
+APP_HOST=0.0.0.0
+APP_ALLOWED_HOSTS=192.168.1.50,nome-pc
+APP_PORT=5000
+```
+
+In questo caso chiunque sia sulla stessa rete può usare la dashboard,
+comprese le funzioni che cancellano trade e storico: imposta una password
+nelle Impostazioni e usala solo su reti fidate.
+
 ### Da riga di comando
 
 ```bash
