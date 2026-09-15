@@ -1,0 +1,22 @@
+# Secrets
+.env
+touch.env.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Local data / runtime output
+trades.db
+backups/
+filter_reports/
+macro_reports/
+screener_reports/
+technical_reports/
+orchestrator_output/
+
+# Claude Code local settings
+.claude/
