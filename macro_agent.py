@@ -26,24 +26,27 @@ OUTPUT_DIR = Path("macro_reports")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # --- Query di ricerca per area tematica ---------------------------------------
+# Anno calcolato a runtime: un anno fisso nelle query fa tornare notizie vecchie
+_YEAR = datetime.now().year
+
 SEARCH_QUERIES = {
     "fed_policy": [
-        "Federal Reserve interest rate decision 2025",
+        f"Federal Reserve interest rate decision {_YEAR}",
         "Fed FOMC meeting minutes latest",
         "Jerome Powell speech rates outlook",
     ],
     "ecb_policy": [
-        "ECB European Central Bank rate decision 2025",
+        f"ECB European Central Bank rate decision {_YEAR}",
         "Christine Lagarde speech monetary policy",
         "ECB deposit rate cut outlook",
     ],
     "inflation_usa": [
-        "US CPI inflation data latest 2025",
+        f"US CPI inflation data latest {_YEAR}",
         "US PCE personal consumption expenditures",
         "US core inflation trend",
     ],
     "inflation_eu": [
-        "Eurozone HICP inflation data 2025",
+        f"Eurozone HICP inflation data {_YEAR}",
         "EU inflation ECB target",
         "Germany France inflation latest",
     ],

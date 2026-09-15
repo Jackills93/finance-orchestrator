@@ -178,24 +178,27 @@ def _get_fomc_upcoming(days: int = 30) -> list[str]:
 
 
 def _get_macro_data() -> dict:
-    """Legge l'ultima analisi salvata per estrarre macro bias + narrativa + VIX."""
-    history_dir = BASE_DIR / "history"
-    if not history_dir.exists():
+    """Legge l'ultimo run dell'orchestratore per estrarre macro bias + narrativa + VIX."""
+    out_dir = BASE_DIR / "orchestrator_output"
+    if not out_dir.exists():
         return {}
-    files = sorted(history_dir.glob("analysis_*.json"), reverse=True)
-    for f in files[:3]:
+    # run_latest.json per primo, poi i run storici dal piu recente
+    files = [out_dir / "run_latest.json"] + sorted(out_dir.glob("run_2*.json"), reverse=True)[:3]
+    for f in files:
         try:
+            if not f.exists():
+                continue
             data = json.loads(f.read_text(encoding="utf-8"))
             macro = data.get("macro_analysis") or {}
             if macro:
                 return {
                     "bias":      macro.get("overall_market_bias", "—"),
                     "narrative": macro.get("macro_narrative", ""),
-                    "vix":       (data.get("vix_data") or {}).get("value"),
+                    "vix":       (macro.get("vix") or {}).get("value"),
                     "ts":        data.get("run_timestamp", ""),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Lettura {f.name} fallita: {e}")
     return {}
 
 

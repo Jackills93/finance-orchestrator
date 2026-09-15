@@ -3,8 +3,8 @@ orchestrator.py -- Orchestratore Multi-Agente Finanziario
 Coordina in sequenza: macro_agent -> filter_agent -> technical_agent
 Produce la raccomandazione finale con score composito.
 
-Dipendenze: pip install anthropic requests pandas python-dotenv
-Variabili d'ambiente: ANTHROPIC_API_KEY, FMP_API_KEY, ALPHA_VANTAGE_API_KEY
+Dipendenze: pip install -r requirements.txt
+Variabili d'ambiente: ANTHROPIC_API_KEY, ALPHA_VANTAGE_API_KEY
 """
 
 import os
@@ -58,7 +58,7 @@ def apply_macro_adjustment(filter_results: list, sector_risk: dict) -> list:
 def build_final_ranking(technical_results: list) -> list:
     """
     Costruisce il ranking finale combinando score tecnico e fondamentale.
-    Pesi finali: fondamentale 60% . tecnico 40% (gia calcolato in technical_agent).
+    Pesi finali: tecnico 55% . fondamentale 45% (gia calcolato in technical_agent).
     Aggiunge il segnale operativo definitivo.
     """
     ranked = []
@@ -171,7 +171,7 @@ def print_final_recommendation(ranking: list, report: dict, macro: dict) -> None
     print(f"  Score tecnico:      {top.get('technical_score', 'n/a')}/100")
     print(f"  Macro adjustment:   {top.get('macro_adjustment', 0):+d} pt  (risk score settore)")
     print(f"  Confidenza:         {top['confidence'].upper()}")
-    print(f"  MA50/MA200:         {top.get('ma50', 'n/a')} / {top.get('ma200', 'n/a')}")
+    print(f"  MA20/MA50 (sett.):  {top.get('ma20', 'n/a')} / {top.get('ma50', 'n/a')}")
     print(f"  RSI settimanale:    {top.get('rsi', 'n/a')}")
     print(f"  Entrata giornaliera:{top.get('entry_signal', 'n/a')}")
 
