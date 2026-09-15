@@ -25,7 +25,7 @@ Orchestratore    →  aggiustamento macro, ranking finale e raccomandazione di C
 | `technical_agent.py` | Scoring tecnico, SL/TP su ATR e position sizing |
 | `app.py` | Dashboard Flask (`http://localhost:5000`) |
 | `monitor.py` | Controllo SL/TP ogni 5 minuti e alert Telegram |
-| `weekly_report.py` | Email riepilogativa del sabato |
+| `weekly_report.py` | Report riepilogativo via email (invio manuale) |
 | `avvia.bat` / `ferma.bat` / `riattiva-monitor.bat` | Avvio e arresto su Windows |
 
 ## Setup
@@ -47,14 +47,14 @@ ALPHA_VANTAGE_API_KEY=xxxx
 TELEGRAM_BOT_TOKEN=xxxx
 TELEGRAM_CHAT_ID=xxxx
 
-# Opzionali: email (report settimanale e fallback alert)
+# Opzionali: email (report riepilogativo e fallback alert)
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=xxxx
 SMTP_PASS=xxxx
 NOTIFY_EMAIL=xxxx
 
-# Opzionale: calendario trimestrali nel report settimanale (fallback: yfinance)
+# Opzionale: calendario trimestrali nel report (fallback: yfinance)
 FMP_API_KEY=xxxx
 
 # Opzionali: position sizing (capitale vuoto o 0 = sizing disattivato)
@@ -231,11 +231,24 @@ schtasks /Create /TN "FinanceOrchestratorMonitor" /SC MINUTE /MO 5 ^
   /TR "\"<percorso python.exe>\" \"<percorso cartella progetto>\monitor.py\"" /F
 ```
 
-`weekly_report.py` va eseguito ogni sabato alle 09:00:
+## Report via email
+
+Il report (trade aperti, trimestrali delle prossime 2 settimane, riunioni FOMC
+e contesto macro dell'ultima analisi) **non viene più inviato in automatico**.
+Si invia manualmente:
+
+- dalla dashboard, tab **Trade journal** → pulsante **Invia report**;
+- da riga di comando: `python weekly_report.py`.
+
+Richiede `SMTP_USER` e `SMTP_PASS` nel `.env` (per Gmail una *password per le app*);
+il destinatario è `NOTIFY_EMAIL`, o `SMTP_USER` se non impostato.
+
+Se in passato era stata creata l'attività pianificata del sabato, va rimossa su Windows
+(da un prompt come amministratore):
 
 ```bat
-schtasks /Create /TN "FinanceScreenerWeeklyReport" /SC WEEKLY /D SAT /ST 09:00 ^
-  /TR "\"<percorso python.exe>\" \"<percorso cartella progetto>\weekly_report.py\"" /F
+schtasks /Query /FO LIST | findstr /I "Report"
+schtasks /Delete /TN "FinanceScreenerWeeklyReport" /F
 ```
 
 ## Note operative

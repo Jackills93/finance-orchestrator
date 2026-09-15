@@ -271,6 +271,7 @@
     border-radius: var(--radius-sm); padding: 7px 13px; font-size: 12px;
     color: var(--muted); cursor: pointer; transition: all .15s; }
   .btn-outline:hover { border-color: var(--blue); color: var(--blue); }
+  .btn-outline:disabled { opacity: .55; cursor: wait; }
   .journal-wrap { background: var(--surface); border: 1px solid var(--border);
     border-radius: var(--radius); overflow: hidden; }
   .journal-table { width: 100%; border-collapse: collapse; }
@@ -620,8 +621,8 @@
       </div>
       <div class="home-feature">
         <div class="home-feature-icon">&#128197;</div>
-        <div class="home-feature-title" data-i18n="home_feat5_title">Report settimanale</div>
-        <div class="home-feature-desc" data-i18n="home_feat5_desc">Ogni sabato mattina ricevi via email un riepilogo: macro bias, trade attivi, trimestrali e riunioni FED della settimana.</div>
+        <div class="home-feature-title" data-i18n="home_feat5_title">Report via email</div>
+        <div class="home-feature-desc" data-i18n="home_feat5_desc">Dal Trade journal invii quando vuoi un riepilogo via email: macro bias, trade attivi, trimestrali e riunioni FED in arrivo.</div>
       </div>
       <div class="home-feature">
         <div class="home-feature-icon">&#127758;</div>
@@ -768,6 +769,7 @@
         <button class="btn-outline" onclick="exportJson()">&#8595; JSON</button>
         <button class="btn-outline" onclick="document.getElementById('import-input').click()">&#8593; Importa JSON</button>
         <input type="file" id="import-input" accept=".json" style="display:none" onchange="importTrades(this)">
+        <button class="btn-outline" id="btn-send-report" onclick="sendReport()" title="Invia ora via email il riepilogo: trade aperti, trimestrali, riunioni FOMC e contesto macro">&#9993; Invia report</button>
         <button class="btn-danger" onclick="deleteAllTrades()">&#215; Cancella tutto</button>
       </div>
     </div>
@@ -1813,6 +1815,22 @@ function importTrades(input) {
   .catch(function(){ alert('Errore durante l\'importazione.'); });
 }
 
+function sendReport() {
+  if (!confirm('Inviare ora il report via email?\n\nContiene trade aperti, trimestrali delle prossime 2 settimane, riunioni FOMC e contesto macro dell\'ultima analisi.')) return;
+  var btn = document.getElementById('btn-send-report');
+  var label = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = 'Invio in corso&hellip;';
+  fetch('/api/report/send', {method:'POST'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if (!d.ok) { alert('Report non inviato: '+(d.error||'errore sconosciuto')); return; }
+    alert(d.message+' ('+d.n_trades+' trade aperti).');
+  })
+  .catch(function(){ alert('Errore durante l\'invio del report.'); })
+  .finally(function(){ btn.disabled = false; btn.innerHTML = label; });
+}
+
 function exportCsv()  { window.location.href='/api/trades/export/csv'; }
 function exportJson() { window.location.href='/api/trades/export/json'; }
 
@@ -2147,7 +2165,7 @@ var TRANSLATIONS = {
     home_feat2_title:'AI powered', home_feat2_desc:'Claude (Anthropic) analizza ogni titolo con dati tecnici e fondamentali in tempo reale via yfinance e Alpha Vantage.',
     home_feat3_title:'Alert automatici', home_feat3_desc:'Monitor SL/TP attivo 24h tramite Task Scheduler. Ricevi notifiche istantanee su Telegram quando un livello viene toccato.',
     home_feat4_title:'Trade Journal', home_feat4_desc:'Registra apertura e chiusura, traccia P&amp;L, capitale investito e performance storica con grafici integrati.',
-    home_feat5_title:'Report settimanale', home_feat5_desc:'Ogni sabato mattina ricevi via email un riepilogo: macro bias, trade attivi, trimestrali e riunioni FED della settimana.',
+    home_feat5_title:'Report via email', home_feat5_desc:'Dal Trade journal invii quando vuoi un riepilogo via email: macro bias, trade attivi, trimestrali e riunioni FED in arrivo.',
     home_feat6_title:'Analisi macro', home_feat6_desc:'VIX, bias di mercato, narrativa macroeconomica aggiornata: il contesto globale prima di ogni decisione operativa.',
     home_disc_title:'&#9888;&#65039; Avvertenze legali — Si prega di leggere',
     home_disc_p1:'<strong>Finance Screener non è un servizio di consulenza finanziaria.</strong> I segnali, le analisi e i contenuti generati dall\'intelligenza artificiale hanno carattere puramente informativo e non costituiscono raccomandazioni di investimento, sollecitazione all\'acquisto o alla vendita di strumenti finanziari ai sensi del D.Lgs. 58/1998 (T.U.F.) e della Direttiva europea MiFID II (2014/65/UE).',
@@ -2199,7 +2217,7 @@ var TRANSLATIONS = {
     home_feat2_title:'AI powered', home_feat2_desc:'Claude (Anthropic) analyses each ticker with real-time technical and fundamental data via yfinance and Alpha Vantage.',
     home_feat3_title:'Automatic alerts', home_feat3_desc:'24h SL/TP monitor via Task Scheduler. Get instant Telegram notifications when a level is hit.',
     home_feat4_title:'Trade Journal', home_feat4_desc:'Log entries and exits, track P&amp;L, capital invested and historical performance with built-in charts.',
-    home_feat5_title:'Weekly report', home_feat5_desc:'Every Saturday morning receive an email summary: macro bias, active trades, earnings and FED meetings for the week.',
+    home_feat5_title:'Email report', home_feat5_desc:'Send an email summary from the Trade journal whenever you want: macro bias, active trades, upcoming earnings and FED meetings.',
     home_feat6_title:'Macro analysis', home_feat6_desc:'VIX, market bias, updated macroeconomic narrative: global context before every trading decision.',
     home_disc_title:'&#9888;&#65039; Legal Notices — Please read',
     home_disc_p1:'<strong>Finance Screener is not a financial advisory service.</strong> The signals, analyses and AI-generated content are purely informational and do not constitute investment recommendations or solicitations to buy or sell financial instruments under applicable regulations including MiFID II (2014/65/EU).',

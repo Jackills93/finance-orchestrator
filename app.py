@@ -86,6 +86,9 @@ PIPELINE_LOG_MAXLEN = 5000  # righe
 # pipe di stdout non riceve mai EOF, e la lettura resta sospesa per sempre).
 PIPELINE_STALL_TIMEOUT = 180  # secondi
 
+# Evita invii doppi del report se il pulsante viene premuto due volte
+_report_lock = threading.Lock()
+
 
 def _trim_pipeline_log():
     try:
@@ -837,6 +840,24 @@ def api_trades_delete_all():
         conn.execute("DELETE FROM trades")
         conn.commit()
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/report/send", methods=["POST"])
+def api_report_send():
+    """Invia manualmente via email il report riepilogativo (non c'e' piu' invio automatico)."""
+    if not _report_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Invio report gia in corso"}), 409
+    try:
+        import weekly_report
+        weekly_report._trim_log()
+        result = weekly_report.run()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Errore generazione report: {e}"}), 500
+    finally:
+        _report_lock.release()
+    if not result["ok"]:
+        return jsonify({"ok": False, "error": result["message"]}), 400
+    return jsonify(result)
 
 
 @app.route("/api/backups")

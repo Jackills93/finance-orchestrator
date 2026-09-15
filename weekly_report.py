@@ -1,10 +1,7 @@
 """
-weekly_report.py — Report settimanale Finance Screener
-Eseguito ogni sabato alle 09:00 dal Task Scheduler di Windows.
-
-Registra il task (una tantum, da eseguire come amministratore):
-  schtasks /Create /TN "FinanceScreenerWeeklyReport" /SC WEEKLY /D SAT /ST 09:00 ^
-    /TR "\"<percorso python.exe>\" \"<percorso cartella progetto>\\weekly_report.py\"" /F
+weekly_report.py — Report riepilogativo Finance Screener
+Invio solo manuale: pulsante "Invia report" nel tab Trade journal della
+dashboard, oppure da riga di comando con  python weekly_report.py
 """
 
 import os
@@ -22,11 +19,15 @@ BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
 
 LOG_FILE = BASE_DIR / "weekly_report.log"
-logging.basicConfig(
-    filename=str(LOG_FILE), level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+# Logger dedicato (non basicConfig): il modulo viene importato anche da app.py
+# e non deve dirottare su file i log del server Flask
+log = logging.getLogger("weekly_report")
+if not log.handlers:
+    _fh = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    log.addHandler(_fh)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 # ---- FOMC schedule (aggiorna ogni anno) --------------------------------------
 FOMC_DATES = [
@@ -208,7 +209,6 @@ def _build_html(trades: list[dict], macro: dict, earnings: list[dict],
                 fomc: list[str], sym: str) -> str:
 
     today_str   = datetime.today().strftime("%d/%m/%Y")
-    next_sat    = (datetime.today() + timedelta(days=7)).strftime("%d/%m/%Y")
     macro_ts    = macro.get("ts", "")[:16].replace("T", " ") if macro.get("ts") else "—"
 
     bias        = (macro.get("bias") or "—").replace("_", " ")
@@ -283,7 +283,7 @@ def _build_html(trades: list[dict], macro: dict, earnings: list[dict],
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
-  <title>Finance Screener — Report settimanale {today_str}</title>
+  <title>Finance Screener — Report del {today_str}</title>
 </head>
 <body style="margin:0;padding:0;background:#14130f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e8ddc8">
 <div style="max-width:660px;margin:0 auto;padding:32px 16px">
@@ -291,15 +291,14 @@ def _build_html(trades: list[dict], macro: dict, earnings: list[dict],
   <!-- Header -->
   <div style="background:linear-gradient(135deg,#4f98a3 0%,#5a8f38 100%);border-radius:14px;padding:26px 28px;margin-bottom:22px">
     <div style="font-size:22px;font-weight:800;letter-spacing:-.02em">Finance Screener</div>
-    <div style="font-size:14px;opacity:.85;margin-top:5px">Report settimanale &mdash; settimana del {next_sat}</div>
-    <div style="font-size:12px;opacity:.65;margin-top:2px">Generato il {today_str}</div>
+    <div style="font-size:14px;opacity:.85;margin-top:5px">Report riepilogativo &mdash; {today_str}</div>
   </div>
 
   <!-- Reminder -->
   <div style="background:#1c1a15;border:1px solid #2a2520;border-left:4px solid #5fb3bf;border-radius:12px;padding:20px 22px;margin-bottom:18px">
-    <div style="font-size:11px;font-weight:700;color:#5fb3bf;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px">&#128270; Promemoria analisi settimanale</div>
+    <div style="font-size:11px;font-weight:700;color:#5fb3bf;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px">&#128270; Promemoria analisi</div>
     <div style="font-size:14px;line-height:1.65">
-      Buon sabato! &Egrave; il momento di aggiornare la tua watchlist. Avvia <b>Finance Screener</b>, seleziona i mercati di interesse e clicca <b>Avvia analisi</b> per ricevere i segnali aggiornati.
+      Se l'ultima analisi non &egrave; recente, aggiorna la tua watchlist. Avvia <b>Finance Screener</b>, seleziona i mercati di interesse e clicca <b>Avvia analisi</b> per ricevere i segnali aggiornati.
     </div>
     <div style="margin-top:14px">
       <a href="http://localhost:5000" style="display:inline-block;background:linear-gradient(135deg,#4f98a3,#5a8f38);color:#fff;text-decoration:none;padding:10px 22px;border-radius:8px;font-size:13px;font-weight:700">Apri Finance Screener &rarr;</a>
@@ -383,16 +382,19 @@ def _build_html(trades: list[dict], macro: dict, earnings: list[dict],
 
 # ---- Send -------------------------------------------------------------------
 
-def _send_report(html: str, subject: str):
+def _send_report(html: str, subject: str) -> tuple[bool, str, str]:
+    """Invia il report. Restituisce (ok, messaggio, destinatario)."""
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", 587))
     smtp_user = os.getenv("SMTP_USER", "").strip()
     smtp_pass = os.getenv("SMTP_PASS", "").strip()
-    notify    = os.getenv("NOTIFY_EMAIL", smtp_user).strip()
+    notify    = (os.getenv("NOTIFY_EMAIL", "") or smtp_user).strip()
 
-    if not smtp_user or not smtp_pass or not notify:
-        log.warning("Email non configurata — report non inviato")
-        return
+    missing = [k for k, v in (("SMTP_USER", smtp_user), ("SMTP_PASS", smtp_pass)) if not v]
+    if missing or not notify:
+        msg_txt = f"Email non configurata: imposta {', '.join(missing or ['NOTIFY_EMAIL'])} nel file .env"
+        log.warning(msg_txt)
+        return False, msg_txt, notify
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -401,20 +403,23 @@ def _send_report(html: str, subject: str):
     msg.attach(MIMEText(html, "html", "utf-8"))
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port) as s:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
             s.ehlo()
             s.starttls()
             s.login(smtp_user, smtp_pass)
             s.sendmail(smtp_user, notify, msg.as_string())
         log.info(f"Report inviato a {notify}")
+        return True, f"Report inviato a {notify}", notify
     except Exception as e:
         log.error(f"Errore invio email: {e}")
+        return False, f"Errore invio email: {e}", notify
 
 
 # ---- Main -------------------------------------------------------------------
 
-def run():
-    log.info("--- Report settimanale avviato ---")
+def run() -> dict:
+    """Genera e invia il report. Restituisce {ok, message, recipient, n_trades}."""
+    log.info("--- Report avviato (invio manuale) ---")
 
     currency = os.getenv("APP_CURRENCY", "USD")
     sym      = CURRENCY_SYMBOLS.get(currency, "$")
@@ -434,15 +439,21 @@ def run():
 
     html     = _build_html(trades, macro, earnings, fomc, sym)
     today_s  = datetime.today().strftime("%d/%m/%Y")
-    subject  = f"📊 Finance Screener — Report settimanale {today_s}"
+    subject  = f"📊 Finance Screener — Report del {today_s}"
 
-    _send_report(html, subject)
-    log.info("--- Report settimanale terminato ---")
+    ok, message, recipient = _send_report(html, subject)
+    log.info("--- Report terminato ---")
+    return {"ok": ok, "message": message, "recipient": recipient, "n_trades": len(trades)}
 
 
 if __name__ == "__main__":
+    import sys
     _trim_log()
     try:
-        run()
+        result = run()
+        print(result["message"])
+        sys.exit(0 if result["ok"] else 1)
     except Exception as e:
         log.error(f"Errore fatale: {e}", exc_info=True)
+        print(f"Errore fatale: {e}")
+        sys.exit(1)
