@@ -20,3 +20,6 @@ orchestrator_output/
 
 # Claude Code local settings
 .claude/
+
+# macOS
+.DS_Store
