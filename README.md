@@ -8,7 +8,7 @@ journal dei trade e alert automatici su Stop Loss / Take Profit.
 ## Architettura
 
 ```
-Screener (opz.)  →  candidati da S&P 500, FTSE MIB, EuroStoxx 50, Russell 2000 (yfinance)
+Screener (opz.)  →  candidati da S&P 500, S&P SmallCap 600, FTSE MIB, EURO STOXX 50
 Agente Macro     →  notizie Fed/BCE/inflazione via web search di Claude + VIX
 Agente Filtro    →  P/E fwd, P/S, ROE, D/E, EV/EBITDA, P/B, Revenue Growth (yfinance)
 Agente Tecnico   →  MA 20/50 sett., MACD, RSI, RS vs indice, sector rotation, ATR
@@ -112,7 +112,7 @@ nelle Impostazioni e usala solo su reti fidate.
 python orchestrator.py ASML NVDA JPM CAT ENI.MI
 
 # Screening automatico su uno o più mercati
-python orchestrator.py --auto-screen --markets sp500 italy europe russell2000
+python orchestrator.py --auto-screen --markets sp500 sp600 italy europe
 
 # Screening S&P 500 limitato ad alcuni settori
 python orchestrator.py --auto-screen --sectors Technology Industrials --max-per-sector 2
@@ -124,13 +124,41 @@ python orchestrator.py ASML NVDA JPM --refresh-macro
 ### Singoli agenti (per test)
 
 ```bash
-python screener_agent.py sp500 italy
+python screener_agent.py sp500 sp600 italy europe
 python macro_agent.py
 python filter_agent.py
 python technical_agent.py
 ```
 
 ## Logica di scoring
+
+### Screener — screener_agent.py
+
+La pipeline lavora solo su **Technology, Financials, Industrials** in tutti i mercati.
+I nomi dei settori delle varie fonti (GICS, ICB, Yahoo Finance) vengono ricondotti a
+questi tre da `sectors.py`; i servizi di comunicazione contano come Technology.
+Un ticker inserito a mano fuori da questi settori viene escluso dal filtro con il motivo.
+
+| Mercato (`--markets`) | Composizione | Controvalore medio minimo | Pick per settore / totale |
+|---|---|---|---|
+| `sp500` S&P 500 | GitHub datasets | 50 M$ | 3 / 2 / 2 |
+| `sp600` S&P SmallCap 600 | Wikipedia | 3 M$ | 2 per settore, max 5 |
+| `italy` FTSE MIB | Wikipedia | 5 M€ | 2 per settore, max 5 |
+| `europe` EURO STOXX 50 | Wikipedia | 20 M€ | 2 per settore, max 5 |
+
+`russell2000` è ancora accettato come alias di `sp600`.
+
+1. **Composizione**: scaricata una volta al giorno e salvata in `screener_reports/universe/`.
+   Se il download fallisce si usa l'ultima copia salvata, altrimenti una lista di riserva interna.
+2. **Liquidità**: controvalore medio giornaliero (prezzo × volume, 60 giorni), calcolato con
+   un unico download di prezzi per blocchi di 100 titoli.
+3. **Filtri minimi**: market cap, P/E forward ≤ 80, crescita ricavi ≥ −10%.
+4. **Punteggio preliminare** (0-100): percentili *dentro il settore* di crescita ricavi (30%),
+   ROE (25%), P/E forward basso (25%, negativo = peggiore), posizione nel range di 52 settimane (20%).
+   Un dato mancante vale 50° percentile.
+
+Ticker senza prezzi o senza dati fondamentali vengono elencati nel log e nel report
+(`screener_latest.json` → `markets` → copertura per mercato).
 
 ### Aggiustamento macro — orchestrator.py
 
@@ -209,7 +237,8 @@ COMPOSITE_FUND_WEIGHT = 0.45
 ```
 orchestrator_output/run_YYYYMMDD_HHMM.json   ← output completo con timestamp
 orchestrator_output/run_latest.json           ← sempre l'ultimo run
-screener_reports/screener_latest.json
+screener_reports/screener_latest.json         ← selezionati + copertura per mercato
+screener_reports/universe/<mercato>.json      ← composizione indici (cache giornaliera)
 macro_reports/macro_report_latest.json        ← analisi macro (cache giornaliera)
 filter_reports/filter_report_latest.json
 technical_reports/technical_report_latest.json

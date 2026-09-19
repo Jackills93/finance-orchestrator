@@ -3,18 +3,24 @@ screener_agent.py -- Agente di Screening Autonomo
 Orchestratore multi-agente finanziario
 
 Scopre automaticamente i candidati migliori partendo da più universi azionari:
-  - S&P 500 (USA large cap)
-  - FTSE MIB (Italia)
-  - EuroStoxx 50 (Europa)
-  - Russell 2000 (USA small cap)
+  - S&P 500           (USA large cap)   -> lista da GitHub (datasets/s-and-p-500-companies)
+  - S&P SmallCap 600  (USA small cap)   -> lista da Wikipedia
+  - FTSE MIB          (Italia)          -> lista da Wikipedia
+  - EURO STOXX 50     (Europa)          -> lista da Wikipedia
 
-Flusso: lista ticker per mercato -> pre-filtro qualitativo -> top N per mercato
+Flusso per ogni mercato:
+  1. composizione dell'indice (scaricata una volta al giorno, con copia salvata
+     e lista di riserva interna se il download fallisce)
+  2. solo i settori della pipeline (Technology / Financials / Industrials, vedi sectors.py)
+  3. liquidità: controvalore medio giornaliero, calcolato in blocco dai prezzi
+  4. filtri fondamentali minimi (market cap, P/E forward, crescita ricavi)
+  5. punteggio preliminare relativo al settore (percentili) e top N per settore
 
-Dipendenze: pip install yfinance pandas requests python-dotenv
+Dipendenze: pip install yfinance pandas requests lxml python-dotenv
 """
 
+import io
 import json
-import time
 import requests
 import pandas as pd
 import yfinance as yf
@@ -22,155 +28,234 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from sectors import TARGET_SECTORS, normalize_sector
+
 OUTPUT_DIR = Path("screener_reports")
 OUTPUT_DIR.mkdir(exist_ok=True)
+UNIVERSE_DIR = OUTPUT_DIR / "universe"
+UNIVERSE_DIR.mkdir(exist_ok=True)
+
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (finance-orchestrator screener)"}
 
 # ---- Configurazione per-mercato ----------------------------------------------
+# min_avg_value: controvalore medio giornaliero (prezzo x volume, ultimi 60 giorni)
+# nella valuta di quotazione. Sostituisce il vecchio filtro sul numero di azioni,
+# che penalizzava i titoli con prezzo alto e favoriva quelli con prezzo basso.
 
 MARKET_CONFIG = {
     "sp500": {
-        "label":             "S&P 500 (USA)",
-        "min_market_cap":    10_000_000_000,   # 10B USD
-        "min_avg_volume":     1_000_000,
+        "label":              "S&P 500 (USA)",
+        "min_market_cap":     10_000_000_000,
+        "min_avg_value":      50_000_000,
         "max_pe_forward":     80,
         "min_revenue_growth": -0.10,
-        "max_per_market":     7,               # compatibile con sector-based (3+2+2)
+        "max_picks":          {"Technology": 3, "Financials": 2, "Industrials": 2},
+        "max_total":          None,
+        "min_universe":       400,
+    },
+    "sp600": {
+        "label":              "S&P SmallCap 600 (USA)",
+        "min_market_cap":     300_000_000,
+        "min_avg_value":      3_000_000,
+        "max_pe_forward":     80,
+        "min_revenue_growth": -0.10,
+        "max_picks":          {"Technology": 2, "Financials": 2, "Industrials": 2},
+        "max_total":          5,
+        "min_universe":       500,
     },
     "italy": {
-        "label":             "FTSE MIB (Italia)",
-        "min_market_cap":     1_000_000_000,   # 1B
-        "min_avg_volume":       100_000,
-        "max_pe_forward":        80,
-        "min_revenue_growth":   -0.10,
-        "max_per_market":         5,
+        "label":              "FTSE MIB (Italia)",
+        "min_market_cap":     1_000_000_000,
+        "min_avg_value":      5_000_000,
+        "max_pe_forward":     80,
+        "min_revenue_growth": -0.10,
+        "max_picks":          {"Technology": 2, "Financials": 2, "Industrials": 2},
+        "max_total":          5,
+        "min_universe":       30,
     },
     "europe": {
-        "label":             "EuroStoxx 50 (Europa)",
-        "min_market_cap":     5_000_000_000,   # 5B
-        "min_avg_volume":       200_000,
-        "max_pe_forward":        80,
-        "min_revenue_growth":   -0.10,
-        "max_per_market":         5,
-    },
-    "russell2000": {
-        "label":             "Russell 2000 (USA Small Cap)",
-        "min_market_cap":       200_000_000,   # 200M
-        "min_avg_volume":       100_000,
-        "max_pe_forward":        80,
-        "min_revenue_growth":   -0.10,
-        "max_per_market":         5,
+        "label":              "EURO STOXX 50 (Europa)",
+        "min_market_cap":     5_000_000_000,
+        "min_avg_value":      20_000_000,
+        "max_pe_forward":     80,
+        "min_revenue_growth": -0.10,
+        "max_picks":          {"Technology": 2, "Financials": 2, "Industrials": 2},
+        "max_total":          5,
+        "min_universe":       40,
     },
 }
 
-# ---- Settori target per S&P 500 ---------------------------------------------
+# Nome storico del mercato small cap (la lista fissa "Russell 2000" non e' piu' usata)
+MARKET_ALIASES = {"russell2000": "sp600"}
 
-TARGET_SECTORS = {
-    "Technology":  {"yf_names": ["Technology"],                        "max_picks": 3},
-    "Financials":  {"yf_names": ["Financial Services", "Banking"],     "max_picks": 2},
-    "Industrials": {"yf_names": ["Industrials"],                       "max_picks": 2},
+# Pesi del punteggio preliminare (percentili dentro il settore)
+PRE_SCORE_WEIGHTS = {
+    "revenue_growth": 0.30,
+    "roe":            0.25,
+    "pe_forward":     0.25,   # piu' basso = meglio
+    "pos_52w":        0.20,   # posizione nel range di 52 settimane
 }
 
-# ---- Liste ticker statiche ---------------------------------------------------
+# ---- Liste di riserva --------------------------------------------------------
+# Usate solo se il download fallisce e non esiste una copia salvata.
+# Composizione Wikipedia del 2026-09-19, gia' ristretta ai tre settori.
 
-FTSE_MIB_TICKERS = [
-    "ENI.MI", "ENEL.MI", "ISP.MI", "UCG.MI", "STLAM.MI", "RACE.MI",
-    "TRN.MI", "SRG.MI", "G.MI", "LDO.MI", "PRY.MI", "MONC.MI",
-    "MB.MI", "BAMI.MI", "STM.MI", "A2A.MI", "NEXI.MI", "AMP.MI",
-    "EXO.MI", "BC.MI", "SPM.MI", "ERG.MI", "IP.MI", "FBK.MI",
-    "REC.MI", "PIRC.MI", "TIT.MI", "CPR.MI", "BMED.MI", "PST.MI",
-    "INWIT.MI", "HERA.MI", "DIA.MI", "SFER.MI",
-]
+FTSE_MIB_FALLBACK = {
+    "Technology":  ["INW.MI", "STMMI.MI", "TIT.MI"],
+    "Financials":  ["AZM.MI", "BAMI.MI", "BMED.MI", "BMPS.MI", "BPE.MI", "FBK.MI", "G.MI",
+                    "ISP.MI", "MB.MI", "PST.MI", "UCG.MI", "UNI.MI"],
+    "Industrials": ["AVIO.MI", "BZU.MI", "FCT.MI", "IVG.MI", "LDO.MI", "NEXI.MI", "PRY.MI"],
+}
 
-EUROSTOXX50_TICKERS = [
-    # Francia
-    "AI.PA", "AIR.PA", "AXA.PA", "BN.PA", "BNP.PA", "DG.PA",
-    "GLE.PA", "MC.PA", "OR.PA", "RI.PA", "SAN.PA", "SGO.PA",
-    "TTE.PA", "EL.PA", "KER.PA", "SU.PA", "VIE.PA", "ML.PA",
-    # Germania
-    "ADS.DE", "ALV.DE", "BAYN.DE", "BMW.DE", "BAS.DE", "DB1.DE",
-    "DTE.DE", "IFX.DE", "MBG.DE", "MUV2.DE", "RWE.DE", "SAP.DE", "SIE.DE",
-    # Paesi Bassi
-    "AD.AS", "ASML.AS", "HEIA.AS", "INGA.AS", "PHIA.AS", "WKL.AS",
-    # Spagna
-    "ACS.MC", "BBVA.MC", "IBE.MC", "ITX.MC", "REP.MC", "SAN.MC",
-    # Belgio
-    "ABI.BR",
-    # Finlandia
-    "NOKIA.HE",
-    # Italia (presenti in EuroStoxx50)
-    "ENI.MI", "ENEL.MI", "ISP.MI", "UCG.MI",
-]
+EUROSTOXX50_FALLBACK = {
+    "Technology":  ["ASML.AS", "DTE.DE", "IFX.DE", "SAP.DE"],
+    "Financials":  ["ADYEN.AS", "ALV.DE", "BBVA.MC", "BNP.PA", "CS.PA", "DB1.DE", "DBK.DE",
+                    "INGA.AS", "ISP.MI", "MUV2.DE", "NDA-FI.HE", "SAN.MC", "UCG.MI"],
+    "Industrials": ["AIR.PA", "DG.PA", "DHL.DE", "ENR.DE", "RHM.DE", "SAF.PA", "SGO.PA",
+                    "SIE.DE", "SU.PA", "WKL.AS"],
+}
 
-RUSSELL2000_TICKERS = [
-    # Technology / Semiconduttori
-    "AMBA", "ACMR", "NVTS", "PRGS", "VIAV", "MGNI", "KLIC", "DIOD",
-    # Healthcare / Biotech
-    "TMDX", "INSP", "RVMD", "MMSI", "ITCI", "ACCD", "MLAB", "GMED",
-    # Finanziari
-    "BANC", "BHLB", "FHB", "WABC", "PFBC", "TCBK", "HOPE", "COLB",
-    # Industriali
-    "UFPI", "PRIM", "POWL", "MYRG", "MATX", "PATK", "KFRC", "ATKR",
-    # Consumer Discretionary
-    "BOOT", "SHAK", "CAKE", "LGIH", "IPAR", "WRLD", "BRBR",
-    # Consumer Staples
-    "CALM", "SMPL", "JJSF", "LANC",
-    # Energia
-    "MTDR", "CVI", "TALO", "CIVI", "MGY", "REX",
-    # REITs
-    "CTRE", "IIPR", "NXRT", "PLYM", "NHI", "GMRE",
-    # Materiali
-    "HWKN", "AZTA", "TREC",
-]
+SP500_FALLBACK = {
+    "Technology":  ["NVDA", "MSFT", "AAPL", "GOOGL", "META", "AVGO", "AMD"],
+    "Financials":  ["JPM", "BAC", "GS", "MS", "WFC"],
+    "Industrials": ["CAT", "HON", "GE", "RTX", "UNP", "LMT"],
+}
 
-# ---- Scoring pre-screening ---------------------------------------------------
+_FALLBACKS = {"sp500": SP500_FALLBACK, "italy": FTSE_MIB_FALLBACK, "europe": EUROSTOXX50_FALLBACK}
 
-def _pre_score(info: dict) -> float:
-    """Score veloce 0-100 per ordinare i candidati."""
-    score = 0.0
 
-    rg = info.get("revenueGrowth")
-    if rg is not None:
-        if rg > 0.20:   score += 30
-        elif rg > 0.10: score += 22
-        elif rg > 0.0:  score += 15
-        else:           score += 5
+# ---- Composizione degli indici -----------------------------------------------
 
-    roe = info.get("returnOnEquity")
-    if roe is not None:
-        if roe > 0.30:   score += 25
-        elif roe > 0.15: score += 18
-        elif roe > 0.05: score += 10
-        else:            score += 3
+def _wikipedia_table(url: str, required_cols: list[str]) -> pd.DataFrame:
+    html = requests.get(url, headers=HTTP_HEADERS, timeout=20).text
+    for table in pd.read_html(io.StringIO(html)):
+        if set(required_cols) <= set(table.columns) and len(table) >= 30:
+            return table
+    raise ValueError(f"tabella con colonne {required_cols} non trovata in {url}")
 
-    pe = info.get("forwardPE")
-    if pe is not None and pe > 0:
-        if pe < 15:   score += 25
-        elif pe < 25: score += 18
-        elif pe < 40: score += 10
-        elif pe < 60: score += 5
 
-    price  = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-    low52  = info.get("fiftyTwoWeekLow",  0)
-    high52 = info.get("fiftyTwoWeekHigh", 0)
-    if price and high52 and low52 and (high52 - low52) > 0:
-        pos = (price - low52) / (high52 - low52)
-        if pos > 0.70:   score += 20
-        elif pos > 0.50: score += 14
-        elif pos > 0.30: score += 8
-        else:            score += 2
+def _rows(df: pd.DataFrame, ticker_col: str, name_col: str, sector_col: str,
+          yahoo_dashes: bool = False) -> list[dict]:
+    rows = []
+    for _, r in df.iterrows():
+        ticker = str(r[ticker_col]).strip()
+        if yahoo_dashes:
+            ticker = ticker.replace(".", "-")   # BRK.B -> BRK-B (formato Yahoo)
+        rows.append({"ticker": ticker, "name": str(r[name_col]).strip(),
+                     "raw_sector": str(r[sector_col]).strip()})
+    return rows
 
-    return round(score, 1)
+
+def _download_universe(market: str) -> list[dict]:
+    if market == "sp500":
+        print("[SCREENER] Download lista S&P500 da GitHub...")
+        df = pd.read_csv("https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv")
+        return _rows(df, "Symbol", "Security", "GICS Sector", yahoo_dashes=True)
+    if market == "sp600":
+        print("[SCREENER] Download lista S&P SmallCap 600 da Wikipedia...")
+        df = _wikipedia_table("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", ["Symbol", "GICS Sector"])
+        return _rows(df, "Symbol", "Security", "GICS Sector", yahoo_dashes=True)
+    if market == "italy":
+        print("[SCREENER] Download composizione FTSE MIB da Wikipedia...")
+        df = _wikipedia_table("https://en.wikipedia.org/wiki/FTSE_MIB", ["Ticker", "ICB Sector"])
+        return _rows(df, "Ticker", "Company", "ICB Sector")
+    if market == "europe":
+        print("[SCREENER] Download composizione EURO STOXX 50 da Wikipedia...")
+        df = _wikipedia_table("https://en.wikipedia.org/wiki/EURO_STOXX_50", ["Ticker", "Sector"])
+        return _rows(df, "Ticker", "Name", "Sector")
+    raise ValueError(f"mercato sconosciuto: {market}")
+
+
+def load_universe(market: str) -> tuple[list[dict], str]:
+    """
+    Composizione dell'indice con settore normalizzato.
+    Ordine: copia di oggi -> download -> ultima copia salvata -> lista di riserva interna.
+    Restituisce (righe, descrizione della fonte usata).
+    """
+    cache = UNIVERSE_DIR / f"{market}.json"
+    today = datetime.now().strftime("%Y-%m-%d")
+    cached = None
+    if cache.exists():
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+        except Exception:
+            cached = None
+    if cached and cached.get("date") == today:
+        return cached["rows"], f"copia di oggi ({len(cached['rows'])} titoli)"
+
+    try:
+        rows = _download_universe(market)
+        min_rows = MARKET_CONFIG[market]["min_universe"]
+        if len(rows) < min_rows:
+            raise ValueError(f"solo {len(rows)} titoli, attesi almeno {min_rows}")
+        cache.write_text(json.dumps({"date": today, "rows": rows}, ensure_ascii=False, indent=1), encoding="utf-8")
+        return rows, f"scaricata oggi ({len(rows)} titoli)"
+    except Exception as e:
+        print(f"  [WARN] Download composizione {market} fallito: {e}")
+
+    if cached:
+        print(f"  [WARN] Uso la copia salvata del {cached.get('date')}")
+        return cached["rows"], f"copia salvata del {cached.get('date')} (download fallito)"
+
+    fallback = _FALLBACKS.get(market)
+    if fallback:
+        print("  [WARN] Uso la lista di riserva interna")
+        rows = [{"ticker": t, "name": t, "raw_sector": s}
+                for s, tickers in fallback.items() for t in tickers]
+        return rows, f"lista di riserva interna ({len(rows)} titoli)"
+    return [], "nessuna lista disponibile"
+
+
+# ---- Liquidità (prezzi in blocco) --------------------------------------------
+
+def _liquidity(tickers: list[str], chunk: int = 100) -> dict:
+    """
+    Controvalore medio giornaliero (ultimi 60 giorni) per ticker, con una sola
+    richiesta di prezzi ogni `chunk` titoli invece di una chiamata .info per titolo.
+    Restituisce {ticker: avg_value} solo per i ticker con dati.
+    """
+    out = {}
+    for i in range(0, len(tickers), chunk):
+        batch = tickers[i:i + chunk]
+        try:
+            data = yf.download(batch, period="3mo", interval="1d", auto_adjust=True,
+                               progress=False, group_by="ticker", threads=True)
+        except Exception as e:
+            print(f"  [WARN] Download prezzi fallito per {len(batch)} titoli: {e}")
+            continue
+        if data is None or data.empty:
+            continue
+        for t in batch:
+            try:
+                frame = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+                px = frame[["Close", "Volume"]].dropna()
+            except KeyError:
+                continue
+            if px.empty:
+                continue
+            out[t] = float((px["Close"] * px["Volume"]).tail(60).mean())
+    return out
+
+
+# ---- Dati fondamentali -------------------------------------------------------
+
+def _fetch_ticker_info(ticker: str) -> dict | None:
+    """Recupera info da Yahoo Finance per un singolo ticker (un nuovo tentativo in caso di errore)."""
+    for _ in range(2):
+        try:
+            info = yf.Ticker(ticker).info
+            if info and (info.get("regularMarketPrice") is not None or info.get("currentPrice") is not None):
+                return info
+        except Exception:
+            pass
+    return None
 
 
 def _passes_pre_filters(info: dict, mkt_cfg: dict) -> tuple[bool, str]:
-    """Verifica i filtri minimi per il mercato specificato."""
-    mc = info.get("marketCap", 0)
+    """Verifica i filtri fondamentali minimi per il mercato specificato."""
+    mc = info.get("marketCap")
     if mc and mc < mkt_cfg["min_market_cap"]:
-        return False, f"market cap {mc/1e9:.1f}B < {mkt_cfg['min_market_cap']/1e9:.0f}B"
-
-    vol = info.get("averageVolume", 0)
-    if vol and vol < mkt_cfg["min_avg_volume"]:
-        return False, f"volume {vol:,} < {mkt_cfg['min_avg_volume']:,}"
+        return False, f"market cap {mc/1e9:.1f}B < {mkt_cfg['min_market_cap']/1e9:g}B"
 
     pe = info.get("forwardPE")
     if pe and pe > mkt_cfg["max_pe_forward"]:
@@ -183,144 +268,141 @@ def _passes_pre_filters(info: dict, mkt_cfg: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
-# ---- Fetch lista S&P500 -----------------------------------------------------
-
-def fetch_sp500_list() -> pd.DataFrame:
-    """Scarica la lista aggiornata dei componenti S&P500 da GitHub."""
-    print("[SCREENER] Download lista S&P500 da GitHub...")
-    try:
-        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-        df = pd.read_csv(url)[["Symbol", "Security", "GICS Sector"]].copy()
-        df.columns = ["ticker", "name", "sector"]
-        df["ticker"] = df["ticker"].str.replace(".", "-", regex=False)
-        print(f"  -> {len(df)} componenti caricati")
-        return df
-    except Exception as e:
-        print(f"  [ERR] Download S&P500 fallito: {e}")
-        return pd.DataFrame(columns=["ticker", "name", "sector"])
+def _pos_52w(info: dict) -> float | None:
+    price  = info.get("currentPrice") or info.get("regularMarketPrice")
+    low52  = info.get("fiftyTwoWeekLow")
+    high52 = info.get("fiftyTwoWeekHigh")
+    if price and low52 and high52 and high52 > low52:
+        return (price - low52) / (high52 - low52)
+    return None
 
 
-def _map_gics_to_target(gics_sector: str) -> str | None:
-    mapping = {
-        "Information Technology":  "Technology",
-        "Communication Services":  "Technology",
-        "Financials":              "Financials",
-        "Industrials":             "Industrials",
-    }
-    return mapping.get(gics_sector)
+# ---- Punteggio preliminare relativo al settore -------------------------------
+
+def _percentile(values: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    """Percentile 0-1 dentro il gruppo; dato mancante = 0.5 (neutro), gruppo di 1 = 0.5."""
+    valid = values.dropna()
+    out = pd.Series(0.5, index=values.index)
+    if len(valid) > 1:
+        ranks = valid.rank(method="average", ascending=higher_is_better)
+        out.loc[valid.index] = (ranks - 1) / (len(valid) - 1)
+    return out
 
 
-# ---- Fetch info singolo ticker -----------------------------------------------
-
-def _fetch_ticker_info(ticker: str) -> dict | None:
-    """Recupera info da Yahoo Finance per un singolo ticker."""
-    try:
-        info = yf.Ticker(ticker).info
-        if not info or (info.get("regularMarketPrice") is None and info.get("currentPrice") is None):
-            return None
-        return info
-    except Exception:
-        return None
-
-
-# ---- Screening S&P500 per settore -------------------------------------------
-
-def screen_sector(
-    candidates: list[str],
-    sector_label: str,
-    max_picks: int,
-    mkt_cfg: dict,
-    workers: int = 5,
-) -> list[dict]:
-    """Screening per un settore dell'S&P500."""
-    print(f"\n[SCREENER] Settore {sector_label} -- {len(candidates)} candidati")
-    results = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_fetch_ticker_info, t): t for t in candidates}
-        done = 0
-        for fut in as_completed(futures):
-            t    = futures[fut]
-            info = fut.result()
-            done += 1
-            if done % 20 == 0:
-                print(f"  ... {done}/{len(candidates)} analizzati")
-            if info is None:
-                continue
-            passed, _ = _passes_pre_filters(info, mkt_cfg)
-            if not passed:
-                continue
-            score = _pre_score(info)
-            results.append({
-                "ticker":         t,
-                "name":           info.get("longName", t),
-                "sector":         sector_label,
-                "market":         "sp500",
-                "market_label":   "S&P 500",
-                "pre_score":      score,
-                "market_cap_b":   round((info.get("marketCap") or 0) / 1e9, 1),
-                "pe_forward":     info.get("forwardPE"),
-                "revenue_growth": info.get("revenueGrowth"),
-                "roe":            info.get("returnOnEquity"),
-                "price":          info.get("currentPrice") or info.get("regularMarketPrice"),
-            })
-
-    results.sort(key=lambda x: x["pre_score"], reverse=True)
-    top = results[:max_picks]
-    print(f"  -> Selezionati: {[r['ticker'] for r in top]}")
-    return top
+def _score_candidates(cands: list[dict]) -> None:
+    """Aggiunge pre_score (0-100) a ogni candidato, confrontandolo solo con il suo settore."""
+    if not cands:
+        return
+    df = pd.DataFrame(cands)
+    for col in ["revenue_growth", "roe", "pe_forward", "pos_52w"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # P/E negativo (utili attesi negativi) = peggiore del gruppo
+    df["_pe"] = df["pe_forward"].where(df["pe_forward"].isna() | (df["pe_forward"] > 0), float("inf"))
+    scores = pd.Series(0.0, index=df.index)
+    for _, idx in df.groupby("sector").groups.items():
+        g = df.loc[idx]
+        parts = {
+            "revenue_growth": _percentile(g["revenue_growth"]),
+            "roe":            _percentile(g["roe"]),
+            "pe_forward":     _percentile(g["_pe"], higher_is_better=False),
+            "pos_52w":        _percentile(g["pos_52w"]),
+        }
+        scores.loc[idx] = sum(parts[k] * w for k, w in PRE_SCORE_WEIGHTS.items()) * 100
+    for i, c in enumerate(cands):
+        c["pre_score"] = round(float(scores.iloc[i]), 1)
 
 
-# ---- Screening mercato flat (lista fissa) ------------------------------------
+# ---- Screening di un mercato -------------------------------------------------
 
-def screen_flat_market(
-    tickers: list[str],
-    market_key: str,
-    mkt_cfg: dict,
-    max_picks: int,
+def screen_market(
+    market: str,
+    sectors: list[str] | None = None,
+    max_per_sector: int | None = None,
+    max_per_market: int | None = None,
+    exclude: set | None = None,
     workers: int = 8,
-) -> list[dict]:
-    """
-    Screening per mercati con lista fissa (Italy, Europe, Russell 2000).
-    Non filtra per settore: analizza tutti i ticker e prende i top N.
-    """
-    label = mkt_cfg["label"]
-    print(f"\n[SCREENER] {label} -- {len(tickers)} candidati")
-    results = []
+) -> tuple[list[dict], dict]:
+    """Screening completo di un mercato. Restituisce (selezionati, statistiche)."""
+    cfg   = MARKET_CONFIG[market]
+    label = cfg["label"]
+    exclude = exclude or set()
+    wanted  = [s for s in TARGET_SECTORS if sectors is None or s in sectors]
+    print(f"\n[SCREENER] {label}")
 
+    universe, source = load_universe(market)
+    for r in universe:  # ricalcolato anche per le copie salvate, se la mappa cambia
+        r["sector"] = normalize_sector(r.get("raw_sector"))
+    stats = {"label": label, "source": source, "universe": len(universe)}
+
+    in_scope = [r for r in universe if r.get("sector") in wanted and r["ticker"] not in exclude]
+    stats["in_sector"] = len(in_scope)
+    print(f"  -> {len(universe)} titoli ({source}), {len(in_scope)} nei settori {wanted}")
+    if not in_scope:
+        return [], stats
+
+    liquidity = _liquidity([r["ticker"] for r in in_scope])
+    no_data   = [r["ticker"] for r in in_scope if r["ticker"] not in liquidity]
+    liquid    = [r for r in in_scope if liquidity.get(r["ticker"], 0) >= cfg["min_avg_value"]]
+    stats["no_price_data"] = no_data
+    stats["illiquid"]      = len(in_scope) - len(no_data) - len(liquid)
+    stats["liquid"]        = len(liquid)
+    if no_data:
+        print(f"  [WARN] Nessun prezzo per {len(no_data)} ticker: {no_data}")
+    print(f"  -> {len(liquid)} titoli con controvalore medio >= {cfg['min_avg_value']:,.0f}")
+
+    cands, info_failed, excluded = [], [], {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_fetch_ticker_info, t): t for t in tickers}
+        futures = {ex.submit(_fetch_ticker_info, r["ticker"]): r for r in liquid}
         done = 0
         for fut in as_completed(futures):
-            t    = futures[fut]
+            r    = futures[fut]
             info = fut.result()
             done += 1
-            if done % 10 == 0:
-                print(f"  ... {done}/{len(tickers)} analizzati")
+            if done % 10 == 0 or done == len(liquid):
+                print(f"  ... {done}/{len(liquid)} analizzati")
             if info is None:
+                info_failed.append(r["ticker"])
                 continue
-            passed, reason = _passes_pre_filters(info, mkt_cfg)
+            passed, reason = _passes_pre_filters(info, cfg)
             if not passed:
+                excluded[r["ticker"]] = reason
                 continue
-            score = _pre_score(info)
-            sector = info.get("sector") or info.get("industryDisp") or "n/a"
-            results.append({
-                "ticker":         t,
-                "name":           info.get("longName", t),
-                "sector":         sector,
-                "market":         market_key,
+            cands.append({
+                "ticker":         r["ticker"],
+                "name":           info.get("longName") or r["name"],
+                "sector":         r["sector"],
+                "market":         market,
                 "market_label":   label,
-                "pre_score":      score,
                 "market_cap_b":   round((info.get("marketCap") or 0) / 1e9, 1),
+                "avg_value_m":    round(liquidity[r["ticker"]] / 1e6, 1),
                 "pe_forward":     info.get("forwardPE"),
                 "revenue_growth": info.get("revenueGrowth"),
                 "roe":            info.get("returnOnEquity"),
+                "pos_52w":        _pos_52w(info),
                 "price":          info.get("currentPrice") or info.get("regularMarketPrice"),
             })
+    stats["info_failed"]        = info_failed
+    stats["excluded_prefilter"] = excluded
+    stats["candidates"]         = len(cands)
+    if info_failed:
+        print(f"  [WARN] Dati fondamentali non disponibili per {len(info_failed)} ticker: {info_failed}")
 
-    results.sort(key=lambda x: x["pre_score"], reverse=True)
-    top = results[:max_picks]
-    print(f"  -> Selezionati: {[r['ticker'] for r in top]}")
-    return top
+    _score_candidates(cands)
+
+    # Top N per settore, poi eventuale tetto complessivo per mercato
+    selected = []
+    for sector in wanted:
+        n = max_per_sector or cfg["max_picks"].get(sector, 2)
+        pool = sorted((c for c in cands if c["sector"] == sector), key=lambda c: c["pre_score"], reverse=True)
+        selected += pool[:n]
+    max_total = max_per_market or cfg["max_total"]
+    selected.sort(key=lambda c: c["pre_score"], reverse=True)
+    if max_total:
+        selected = selected[:max_total]
+
+    stats["selected"] = len(selected)
+    print(f"  -> Selezionati: {[c['ticker'] for c in selected]}")
+    return selected, stats
 
 
 # ---- Entry point -------------------------------------------------------------
@@ -335,103 +417,37 @@ def run_screener(
     Esegue lo screening autonomo su uno o più mercati.
 
     Args:
-        markets:         Mercati da analizzare: "sp500", "italy", "europe", "russell2000"
-                         (default: ["sp500"])
-        sectors:         Filtra settori S&P500 (default: tutti i TARGET_SECTORS)
-        max_per_sector:  Override max pick per settore S&P500
-        max_per_market:  Override max pick per mercato flat
+        markets:         "sp500", "sp600", "italy", "europe" (default: ["sp500"];
+                         "russell2000" e' accettato come alias di "sp600")
+        sectors:         Sottoinsieme di Technology / Financials / Industrials (default: tutti)
+        max_per_sector:  Override del numero massimo di pick per settore
+        max_per_market:  Override del tetto complessivo per mercato
 
     Returns:
         {"tickers": [...], "details": [...], "summary": {...}}
     """
-    if markets is None:
-        markets = ["sp500"]
+    markets = [MARKET_ALIASES.get(m, m) for m in (markets or ["sp500"])]
+    markets = list(dict.fromkeys(markets))  # deduplica mantenendo l'ordine
 
-    # Deduplica mantenendo l'ordine
-    markets = list(dict.fromkeys(markets))
-
-    all_selected = []
-    seen_tickers = set()
-
-    for mkt_key in markets:
-        mkt_cfg = MARKET_CONFIG.get(mkt_key)
-        if mkt_cfg is None:
-            print(f"[SCREENER] Mercato sconosciuto: {mkt_key} -- skip")
+    all_selected, seen, per_market = [], set(), {}
+    for mkt in markets:
+        if mkt not in MARKET_CONFIG:
+            print(f"[SCREENER] Mercato sconosciuto: {mkt} -- skip")
             continue
+        selected, stats = screen_market(mkt, sectors, max_per_sector, max_per_market, exclude=seen)
+        for c in selected:
+            seen.add(c["ticker"])
+            all_selected.append(c)
+        per_market[mkt] = stats
 
-        # ---- S&P 500: screening per settore ----------------------------------
-        if mkt_key == "sp500":
-            sp500 = fetch_sp500_list()
-            if sp500.empty:
-                sp500 = pd.DataFrame({
-                    "ticker": ["NVDA","MSFT","AAPL","GOOGL","META","AVGO","AMD",
-                               "JPM","BAC","GS","MS","WFC",
-                               "CAT","HON","GE","RTX","UNP","LMT"],
-                    "sector": ["Information Technology"]*7 + ["Financials"]*5 + ["Industrials"]*6,
-                })
-
-            target = {k: v for k, v in TARGET_SECTORS.items()
-                      if sectors is None or k in sectors}
-
-            for sector_label, cfg in target.items():
-                n_picks = max_per_sector or cfg["max_picks"]
-                gics_names = [k for k, v in {
-                    "Information Technology": "Technology",
-                    "Communication Services": "Technology",
-                    "Financials":             "Financials",
-                    "Industrials":            "Industrials",
-                }.items() if v == sector_label]
-
-                candidates = [t for t in sp500[sp500["sector"].isin(gics_names)]["ticker"].tolist()
-                              if t not in seen_tickers]
-                if not candidates:
-                    continue
-
-                selected = screen_sector(candidates, sector_label, n_picks, mkt_cfg)
-                for r in selected:
-                    if r["ticker"] not in seen_tickers:
-                        seen_tickers.add(r["ticker"])
-                        all_selected.append(r)
-
-        # ---- Italia (FTSE MIB) -----------------------------------------------
-        elif mkt_key == "italy":
-            candidates = [t for t in FTSE_MIB_TICKERS if t not in seen_tickers]
-            n_picks = max_per_market or mkt_cfg["max_per_market"]
-            selected = screen_flat_market(candidates, mkt_key, mkt_cfg, n_picks)
-            for r in selected:
-                if r["ticker"] not in seen_tickers:
-                    seen_tickers.add(r["ticker"])
-                    all_selected.append(r)
-
-        # ---- Europa (EuroStoxx 50) -------------------------------------------
-        elif mkt_key == "europe":
-            candidates = [t for t in EUROSTOXX50_TICKERS if t not in seen_tickers]
-            n_picks = max_per_market or mkt_cfg["max_per_market"]
-            selected = screen_flat_market(candidates, mkt_key, mkt_cfg, n_picks)
-            for r in selected:
-                if r["ticker"] not in seen_tickers:
-                    seen_tickers.add(r["ticker"])
-                    all_selected.append(r)
-
-        # ---- Russell 2000 ---------------------------------------------------
-        elif mkt_key == "russell2000":
-            candidates = [t for t in RUSSELL2000_TICKERS if t not in seen_tickers]
-            n_picks = max_per_market or mkt_cfg["max_per_market"]
-            selected = screen_flat_market(candidates, mkt_key, mkt_cfg, n_picks)
-            for r in selected:
-                if r["ticker"] not in seen_tickers:
-                    seen_tickers.add(r["ticker"])
-                    all_selected.append(r)
-
-    # Salva report
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     out_path  = OUTPUT_DIR / f"screener_{timestamp}.json"
-    latest    = OUTPUT_DIR / "screener_latest.json"
-    for path in [out_path, latest]:
+    report    = {"run_timestamp": datetime.now().isoformat(), "selected": all_selected, "markets": per_market}
+    for path in [out_path, OUTPUT_DIR / "screener_latest.json"]:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(all_selected, f, indent=2, default=str, ensure_ascii=False)
+            json.dump(report, f, indent=2, default=str, ensure_ascii=False)
 
-    tickers = [r["ticker"] for r in all_selected]
+    tickers = [c["ticker"] for c in all_selected]
     print(f"\n[SCREENER] Ticker selezionati: {tickers}")
 
     return {
@@ -440,9 +456,10 @@ def run_screener(
         "summary": {
             "markets_screened": markets,
             "total_selected":   len(tickers),
-            "by_market":        {m: sum(1 for r in all_selected if r.get("market") == m) for m in markets},
+            "by_market":        {m: sum(1 for c in all_selected if c["market"] == m) for m in markets},
+            "coverage":         per_market,
             "report_path":      str(out_path),
-        }
+        },
     }
 
 
@@ -453,9 +470,12 @@ if __name__ == "__main__":
     mkts = sys.argv[1:] if len(sys.argv) > 1 else ["sp500"]
     result = run_screener(markets=mkts)
     print("\n-- CANDIDATI SELEZIONATI --")
-    for r in result["details"]:
-        pe  = f"P/E {r['pe_forward']:.1f}" if r["pe_forward"] else "P/E n/a"
-        rg  = f"RevG {r['revenue_growth']*100:.1f}%" if r["revenue_growth"] else ""
-        roe = f"ROE {r['roe']*100:.1f}%" if r["roe"] else ""
-        mkt = r.get("market_label", "")
-        print(f"  {r['ticker']:<10} [{mkt}]  score={r['pre_score']:5.1f}  {pe}  {rg}  {roe}")
+    for c in result["details"]:
+        pe  = f"P/E {c['pe_forward']:.1f}" if c["pe_forward"] else "P/E n/a"
+        rg  = f"RevG {c['revenue_growth']*100:.1f}%" if c["revenue_growth"] is not None else ""
+        roe = f"ROE {c['roe']*100:.1f}%" if c["roe"] is not None else ""
+        print(f"  {c['ticker']:<10} [{c['market_label']}] {c['sector']:<12} score={c['pre_score']:5.1f}  {pe}  {rg}  {roe}")
+    print("\n-- COPERTURA --")
+    for m, s in result["summary"]["coverage"].items():
+        print(f"  {s['label']}: fonte {s['source']} | nei settori {s.get('in_sector', 0)} | "
+              f"liquidi {s.get('liquid', 0)} | candidati {s.get('candidates', 0)} | selezionati {s.get('selected', 0)}")

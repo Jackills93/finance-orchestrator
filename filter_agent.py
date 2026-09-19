@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 import pandas as pd
 import yfinance as yf
 
+from sectors import TARGET_SECTORS, normalize_sector
+
 load_dotenv()
 client   = Anthropic()
 OUTPUT_DIR = Path("filter_reports")
@@ -128,17 +130,9 @@ def fetch_fundamentals(ticker: str) -> dict:
         t    = yf.Ticker(ticker)
         info = t.info
 
-        # Normalizza i nomi settore Yahoo -> nomi interni
-        SECTOR_MAP = {
-            "Financial Services": "Financials",
-            "Banking":            "Financials",
-            "Insurance":          "Financials",
-            "Industrials":        "Industrials",
-            "Technology":         "Technology",
-            "Semiconductor":      "Technology",
-        }
-        raw_sector = info.get("sector", "Technology")
-        sector = SECTOR_MAP.get(raw_sector, raw_sector)
+        # Settore normalizzato (None = fuori dai tre settori della pipeline)
+        raw_sector = info.get("sector") or ""
+        sector = normalize_sector(raw_sector)
 
         # Revenue growth YoY da income statement
         rev_growth = None
@@ -164,6 +158,7 @@ def fetch_fundamentals(ticker: str) -> dict:
             "ticker":         ticker,
             "name":           info.get("longName", ticker),
             "sector":         sector,
+            "raw_sector":     raw_sector,
             "price":          info.get("currentPrice") or info.get("regularMarketPrice"),
             "pe_forward":     info.get("forwardPE"),
             "ps_ratio":       info.get("priceToSalesTrailing12Months"),
@@ -176,7 +171,8 @@ def fetch_fundamentals(ticker: str) -> dict:
     except Exception as e:
         print(f"  [YF ERROR] {ticker}: {e}")
         return {
-            "ticker": ticker, "name": ticker, "sector": "Technology",
+            "ticker": ticker, "name": ticker, "sector": None, "raw_sector": "",
+            "fetch_error": str(e),
             "price": None, "pe_forward": None, "ps_ratio": None,
             "roe": None, "debt_equity": None, "ev_ebitda": None,
             "pb_ratio": None, "revenue_growth": None,
@@ -385,6 +381,27 @@ def run_filter_agent(
 
         # 1. Fetch dati fondamentali
         fund = fetch_fundamentals(ticker)
+
+        # Fuori perimetro o dati Yahoo non disponibili: escluso con motivo, senza narrativa LLM
+        if fund.get("sector") is None:
+            if fund.get("fetch_error"):
+                reason = f"Dati Yahoo Finance non disponibili ({fund['fetch_error'][:80]})"
+            elif not fund.get("raw_sector") and fund.get("price") is None:
+                reason = "Dati Yahoo Finance non disponibili (ticker errato o non piu' quotato?)"
+            else:
+                reason = (f"Settore fuori perimetro ({fund.get('raw_sector') or 'non indicato'}): "
+                          f"la pipeline analizza solo {', '.join(TARGET_SECTORS)}")
+            print(f"  -> ESCLUSO: {reason}")
+            results.append({
+                "ticker": ticker, "name": fund.get("name", ticker), "sector": "N/A",
+                "price": fund.get("price"), "total_score": 0,
+                "pass_knockout": False, "knockout_reason": reason,
+                "pass_to_technical": False,
+                "metric_scores": {}, "metric_notes": {}, "raw_metrics": {},
+                "summary": reason, "strengths": [], "weaknesses": [],
+                "earnings_skip": False,
+            })
+            continue
 
         # 2. Scoring ponderato + knockout
         scored = score_fundamentals(fund)

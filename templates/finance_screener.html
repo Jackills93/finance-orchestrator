@@ -521,7 +521,7 @@
         <label class="mkt-check"><input type="checkbox" name="market" value="sp500" checked> S&amp;P 500</label>
         <label class="mkt-check"><input type="checkbox" name="market" value="italy"> FTSE MIB</label>
         <label class="mkt-check"><input type="checkbox" name="market" value="europe"> EuroStoxx 50</label>
-        <label class="mkt-check"><input type="checkbox" name="market" value="russell2000"> Russell 2000</label>
+        <label class="mkt-check"><input type="checkbox" name="market" value="sp600"> S&amp;P SmallCap 600</label>
       </div>
       <input type="text" id="ticker-input" placeholder="es. AAPL MSFT NVDA" style="display:none;">
       <button class="btn-run" id="btn-run" onclick="startAnalysis()">
@@ -602,7 +602,7 @@
       <div class="home-feature">
         <div class="home-feature-icon">&#127760;</div>
         <div class="home-feature-title" data-i18n="home_feat1_title">Analisi multi-mercato</div>
-        <div class="home-feature-desc" data-i18n="home_feat1_desc">S&amp;P 500, NASDAQ 100, EuroStoxx 50, Russell 2000 o qualsiasi lista di ticker personalizzata.</div>
+        <div class="home-feature-desc" data-i18n="home_feat1_desc">S&amp;P 500, S&amp;P SmallCap 600, FTSE MIB, EURO STOXX 50 o qualsiasi lista di ticker personalizzata.</div>
       </div>
       <div class="home-feature">
         <div class="home-feature-icon">&#129302;</div>
@@ -2161,7 +2161,7 @@ var TRANSLATIONS = {
     home_step3_title:'Leggi i segnali', home_step3_desc:'Ricevi una lista ordinata per score: BUY, STRONG BUY, HOLD. Ogni scheda include analisi pro/contro e livelli chiave.',
     home_step4_title:'Gestisci i trade', home_step4_desc:'Registra i tuoi trade nel journal. Il monitor automatico ti avvisa su Telegram quando SL o TP vengono raggiunti.',
     home_features:'Funzionalità principali',
-    home_feat1_title:'Analisi multi-mercato', home_feat1_desc:'S&amp;P 500, NASDAQ 100, EuroStoxx 50, Russell 2000 o qualsiasi lista di ticker personalizzata.',
+    home_feat1_title:'Analisi multi-mercato', home_feat1_desc:'S&amp;P 500, S&amp;P SmallCap 600, FTSE MIB, EURO STOXX 50 o qualsiasi lista di ticker personalizzata.',
     home_feat2_title:'AI powered', home_feat2_desc:'Claude (Anthropic) analizza ogni titolo con dati tecnici e fondamentali in tempo reale via yfinance e Alpha Vantage.',
     home_feat3_title:'Alert automatici', home_feat3_desc:'Monitor SL/TP attivo 24h tramite Task Scheduler. Ricevi notifiche istantanee su Telegram quando un livello viene toccato.',
     home_feat4_title:'Trade Journal', home_feat4_desc:'Registra apertura e chiusura, traccia P&amp;L, capitale investito e performance storica con grafici integrati.',
@@ -2213,7 +2213,7 @@ var TRANSLATIONS = {
     home_step3_title:'Read the signals', home_step3_desc:'Get a score-ranked list: BUY, STRONG BUY, HOLD. Each card includes a pro/con breakdown and key levels.',
     home_step4_title:'Manage trades', home_step4_desc:'Log your trades in the journal. The automatic monitor alerts you on Telegram when SL or TP levels are hit.',
     home_features:'Key features',
-    home_feat1_title:'Multi-market analysis', home_feat1_desc:'S&amp;P 500, NASDAQ 100, EuroStoxx 50, Russell 2000 or any custom ticker list.',
+    home_feat1_title:'Multi-market analysis', home_feat1_desc:'S&amp;P 500, S&amp;P SmallCap 600, FTSE MIB, EURO STOXX 50 or any custom ticker list.',
     home_feat2_title:'AI powered', home_feat2_desc:'Claude (Anthropic) analyses each ticker with real-time technical and fundamental data via yfinance and Alpha Vantage.',
     home_feat3_title:'Automatic alerts', home_feat3_desc:'24h SL/TP monitor via Task Scheduler. Get instant Telegram notifications when a level is hit.',
     home_feat4_title:'Trade Journal', home_feat4_desc:'Log entries and exits, track P&amp;L, capital invested and historical performance with built-in charts.',

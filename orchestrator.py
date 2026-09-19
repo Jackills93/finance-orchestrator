@@ -221,7 +221,8 @@ def run_orchestrator(
         auto_screen:          Se True, usa lo screener per trovare automaticamente i ticker.
         screen_sectors:       Filtro settori per lo screener (default: tutti).
         max_per_sector:       Numero massimo di pick per settore (default: config screener).
-        markets:              Mercati da analizzare: "sp500", "italy", "europe", "russell2000"
+        markets:              Mercati da analizzare: "sp500", "sp600", "italy", "europe"
+                              ("russell2000" e' accettato come alias di "sp600")
 
     Returns:
         Dict con ranking finale, report narrativo e output intermedi di ogni agente
@@ -338,7 +339,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--auto-screen",
         action="store_true",
-        help="Scopri automaticamente i ticker migliori dall'S&P500 tramite screener",
+        help="Scopri automaticamente i ticker migliori tramite screener (vedi --markets)",
     )
     parser.add_argument(
         "--sectors",
@@ -350,14 +351,14 @@ if __name__ == "__main__":
         "--max-per-sector",
         type=int,
         default=None,
-        help="Numero massimo di ticker per settore nello screener (default: 3/2/2)",
+        help="Numero massimo di ticker per settore nello screener (default: S&P 500 3/2/2, altri mercati 2)",
     )
     parser.add_argument(
         "--markets",
         nargs="+",
-        choices=["sp500", "italy", "europe", "russell2000"],
+        choices=["sp500", "sp600", "italy", "europe", "russell2000"],
         default=["sp500"],
-        help="Mercati da analizzare (default: sp500)",
+        help="Mercati da analizzare: sp500, sp600 (S&P SmallCap 600), italy (FTSE MIB), europe (EURO STOXX 50). Default: sp500",
     )
     parser.add_argument(
         "--refresh-macro",
